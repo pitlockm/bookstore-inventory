@@ -90,7 +90,7 @@ async function lookupInventaire(isbn){
         let ar=await fetch('https://inventaire.io/api/entities?action=by-uris&uris='+encodeURIComponent(uris)).then(x=>x.json());
         author=Object.values(ar.entities||{}).map(e=>pickLabel(e.labels||{})).filter(Boolean).join(', ')}catch(e){}}
     let cover=ent.image?ent.image.url||ent.image:'';
-    if(title)return {isbn,title,author,cover}}catch(e){}
+    if(title)return {isbn,title,author,genre:'',cover}}catch(e){}
   return null;
 }
 /* BnF SRU returns XML with several records per ISBN, including a thin commercial
@@ -112,16 +112,18 @@ function parseBnF(xml){
 async function lookupBnF(isbn){
   try{let url='https://catalogue.bnf.fr/api/SRU?version=1.2&operation=searchRetrieve&query=bib.isbn%20all%20%22'+isbn+'%22&maximumRecords=5';
     let txt=await fetch(url).then(x=>x.text());let p=parseBnF(txt);
-    if(p)return {isbn,title:p.title,author:p.author,cover:''}}catch(e){}
+    if(p)return {isbn,title:p.title,author:p.author,genre:'',cover:''}}catch(e){}
   return null;
 }
 async function lookupISBN(isbn){
   isbn=String(isbn).replace(/[^0-9Xx]/g,'');
   try{let r=await fetch('https://openlibrary.org/isbn/'+isbn+'.json');if(r.ok){let j=await r.json();
     let author='';if(j.authors&&j.authors[0]){let a=await fetch('https://openlibrary.org'+j.authors[0].key+'.json').then(x=>x.json()).catch(()=>({}));author=a.name||''}
-    return {isbn,title:j.title||'',author,cover:j.covers?('https://covers.openlibrary.org/b/id/'+j.covers[0]+'-M.jpg'):('https://covers.openlibrary.org/b/isbn/'+isbn+'-M.jpg')}}}catch(e){}
+    let genre='';if(j.subjects&&j.subjects[0])genre=j.subjects[0];
+    else if(j.works&&j.works[0]){try{let w=await fetch('https://openlibrary.org'+j.works[0].key+'.json').then(x=>x.json());if(w.subjects&&w.subjects[0])genre=w.subjects[0]}catch(e){}}
+    return {isbn,title:j.title||'',author,genre,cover:j.covers?('https://covers.openlibrary.org/b/id/'+j.covers[0]+'-M.jpg'):('https://covers.openlibrary.org/b/isbn/'+isbn+'-M.jpg')}}}catch(e){}
   try{let r=await fetch('https://www.googleapis.com/books/v1/volumes?q=isbn:'+isbn);let j=await r.json();
-    if(j.items&&j.items[0]){let v=j.items[0].volumeInfo;if(v.title)return {isbn,title:v.title||'',author:(v.authors||[]).join(', '),cover:(v.imageLinks&&v.imageLinks.thumbnail)||('https://covers.openlibrary.org/b/isbn/'+isbn+'-M.jpg')}}}catch(e){}
+    if(j.items&&j.items[0]){let v=j.items[0].volumeInfo;if(v.title)return {isbn,title:v.title||'',author:(v.authors||[]).join(', '),genre:(v.categories&&v.categories[0])||'',cover:(v.imageLinks&&v.imageLinks.thumbnail)||('https://covers.openlibrary.org/b/isbn/'+isbn+'-M.jpg')}}}catch(e){}
   let inv=await lookupInventaire(isbn);if(inv)return inv;
   let bnf=await lookupBnF(isbn);if(bnf)return bnf;
   return {isbn,title:'',author:'',cover:''};
@@ -129,56 +131,70 @@ async function lookupISBN(isbn){
 async function searchTitle(q){
   let out=[];
   try{let r=await fetch('https://openlibrary.org/search.json?title='+encodeURIComponent(q)+'&limit=8');let j=await r.json();
-    out=(j.docs||[]).map(d=>({isbn:(d.isbn||[])[0]||'',title:d.title||'',author:(d.author_name||[]).join(', '),cover:d.cover_i?('https://covers.openlibrary.org/b/id/'+d.cover_i+'-M.jpg'):''}))}catch(e){}
+    out=(j.docs||[]).map(d=>({isbn:(d.isbn||[])[0]||'',title:d.title||'',author:(d.author_name||[]).join(', '),genre:(d.subject||[])[0]||'',cover:d.cover_i?('https://covers.openlibrary.org/b/id/'+d.cover_i+'-M.jpg'):''}))}catch(e){}
   if(out.length<3){ /* top up thin results (common for Arabic/French titles) from Google Books */
     try{let r=await fetch('https://www.googleapis.com/books/v1/volumes?q=intitle:'+encodeURIComponent(q)+'&maxResults=8');let j=await r.json();
       (j.items||[]).forEach(it=>{let v=it.volumeInfo||{};let isbn='';(v.industryIdentifiers||[]).forEach(x=>{if(x.type==='ISBN_13')isbn=x.identifier});
-        if(v.title&&!out.some(o=>o.title.toLowerCase()===v.title.toLowerCase()))out.push({isbn,title:v.title,author:(v.authors||[]).join(', '),cover:(v.imageLinks&&v.imageLinks.thumbnail)||''})})}catch(e){}}
+        if(v.title&&!out.some(o=>o.title.toLowerCase()===v.title.toLowerCase()))out.push({isbn,title:v.title,author:(v.authors||[]).join(', '),genre:(v.categories&&v.categories[0])||'',cover:(v.imageLinks&&v.imageLinks.thumbnail)||''})})}catch(e){}}
   return out;
 }
 
+/* --- Genre → shelf auto-fill ---
+   First: where did this shop already shelve this genre? (learns from its own stock)
+   Then: a built-in genre→shelf map. Unknown genre → no shelf, set it by hand once
+   and every later book in that genre follows it automatically. */
+function shelfForGenre(genre){if(!genre)return '';
+  let g=genre.toLowerCase();
+  let same=inv.find(x=>x.genre&&x.genre.toLowerCase()===g&&x.shelf);if(same)return same.shelf;
+  let map=[['science fiction','Fantasy & Sci-Fi'],['fantasy','Fantasy & Sci-Fi'],['mystery','Mystery'],['thriller','Mystery'],['crime','Mystery'],['children','Children'],['juvenile','Children'],['poetry','Poetry'],['biography','Biography'],['memoir','Biography'],['history','History'],['science','Science'],['philosophy','Philosophy'],['religion','Philosophy & Religion'],['art','Art'],['cook','Cooking'],['travel','Travel'],['fiction','Fiction'],['romance','Romance'],['comic','Comics'],['sport','Sports']];
+  for(let [k,s] of map)if(g.includes(k))return s;
+  return ''}
 /* --- Add / edit --- */
 function addBook(b){
   let ex=inv.find(x=>b.isbn&&x.isbn===b.isbn);
   if(ex){ex.qty++;save();render();showMsg('Already on the shelf — added another copy of "'+ex.title+'". Now '+ex.qty+' in stock.');return}
-  let price=prompt('Price for "'+(b.title||'this book')+'"? (e.g. 8.50 — leave blank for $0)', '');
-  let shelf=prompt('Shelf or section? (e.g. Fiction A, History — leave blank if none)','');
+  let price=prompt('Selling price for "'+(b.title||'this book')+'"? (e.g. 8.50 — leave blank for $0)', '');
+  let cost=prompt('How much did you pay for this book? (what it cost you, e.g. 3.00 — leave blank if unknown)','');
   let cond=prompt('Condition? Like new, Good, Fair, Worn, or Poor','Good');
-  inv.unshift({id:b.isbn?('isbn:'+b.isbn):uid(),isbn:b.isbn||'',title:b.title||'Unknown title',author:b.author||'',cover:b.cover||'',price:parseFloat(price)||0,shelf:shelf||'',condition:(cond||'Good').trim(),qty:1,sold:0,added:new Date().toISOString().slice(0,10),updatedAt:Date.now()});
-  save();render();showMsg('Added: '+(b.title||'book'));
+  let genre=b.genre||'', shelf=shelfForGenre(genre); /* genre + shelf auto-filled, no prompts */
+  inv.unshift({id:b.isbn?('isbn:'+b.isbn):uid(),isbn:b.isbn||'',title:b.title||'Unknown title',author:b.author||'',genre:genre,cover:b.cover||'',price:parseFloat(price)||0,cost:parseFloat(cost)||0,shelf:shelf,condition:(cond||'Good').trim(),qty:1,sold:0,added:new Date().toISOString().slice(0,10),updatedAt:Date.now()});
+  save();render();
+  showMsg('Added: '+(b.title||'book')+(genre?' · Genre: '+genre:'')+(shelf?' · Shelved in '+shelf:' · No shelf yet — tap Edit to set one, then that genre follows it')+(cost?' · Paid '+money(parseFloat(cost)):''));
 }
 function render(){
   let q=$('q').value.toLowerCase();
-  let list=inv.filter(b=>(b.title+' '+b.author+' '+b.isbn).toLowerCase().includes(q));
+  let list=inv.filter(b=>(b.title+' '+b.author+' '+b.isbn+' '+(b.genre||'')).toLowerCase().includes(q));
   $('statTitles').textContent=inv.length;
   $('statCopies').textContent=inv.reduce((a,b)=>a+b.qty,0);
   $('statValue').textContent=money(inv.reduce((a,b)=>a+b.qty*b.price,0));
   let today=sales.filter(s=>s.date===todayStr());
   $('statToday').textContent=money(today.reduce((a,s)=>a+s.price,0))+' ('+today.length+')';
   $('todaySales').innerHTML=today.length
-    ? today.map(s=>esc(s.title)+' — '+money(s.price)).join('<br>')+'<br><b>Total: '+money(today.reduce((a,s)=>a+s.price,0))+'</b>'
+    ? today.map(s=>esc(s.title)+' — '+money(s.price)).join('<br>')+'<br><b>Total: '+money(today.reduce((a,s)=>a+s.price,0))+' · Profit: '+money(today.reduce((a,s)=>a+(s.price-(s.cost||0)),0))+'</b>'
     : 'Nothing sold yet today.';
   let byDate={};sales.forEach(s=>{byDate[s.date]=byDate[s.date]||[];byDate[s.date].push(s)});
   $('salesHistory').innerHTML=Object.keys(byDate).sort().reverse().map(d=>{
-    let day=byDate[d];return d+' — '+day.length+' sold, '+money(day.reduce((a,s)=>a+s.price,0))}).join('<br>')||'No sales recorded yet.';
+    let day=byDate[d];return d+' — '+day.length+' sold, '+money(day.reduce((a,s)=>a+s.price,0))+' revenue, '+money(day.reduce((a,s)=>a+(s.price-(s.cost||0)),0))+' profit'}).join('<br>')||'No sales recorded yet.';
   $('list').innerHTML=list.length?list.map((b,i)=>{let idx=inv.indexOf(b);return `<div class="card">
     ${b.cover?`<img src="${esc(b.cover)}" alt="">`:''}
-    <div style="flex:1"><b dir="auto">${esc(b.title)}</b><div class="muted" dir="auto">${esc(b.author)}${b.isbn?' · ISBN '+esc(b.isbn):''}${b.shelf?' · 📍 '+esc(b.shelf):''}${b.condition?' · ✨ '+esc(b.condition):''}</div>
-    <div style="margin:6px 0">${money(b.price)} each · <b>${b.qty} in stock</b>${b.sold?' · '+b.sold+' sold':''}</div>
+    <div style="flex:1"><b dir="auto">${esc(b.title)}</b><div class="muted" dir="auto">${esc(b.author)}${b.isbn?' · ISBN '+esc(b.isbn):''}${b.genre?' · 📚 '+esc(b.genre):''}${b.shelf?' · 📍 '+esc(b.shelf):''}${b.condition?' · ✨ '+esc(b.condition):''}</div>
+    <div style="margin:6px 0">${money(b.price)} each${b.cost?' · paid '+money(b.cost):''} · <b>${b.qty} in stock</b>${b.sold?' · '+b.sold+' sold':''}</div>
     <div class="row">
       <button class="sell" onclick="sell(${idx})">💰 Sold One</button>
       <button class="ghost" onclick="bump(${idx},1)">＋ Add Copy</button>
-      <button class="ghost" onclick="editBook(${idx})">✏️ Price / Shelf</button>
+      <button class="ghost" onclick="editBook(${idx})">✏️ Edit</button>
       <button class="ghost" onclick="removeBook(${idx})">🗑️ Remove</button>
     </div></div></div>`}).join(''):'<p class="muted">No books on the shelves yet. Tap "Scan a Book" to add your first one.</p>';
 }
 window.sell=i=>{if(inv[i].qty>0){inv[i].qty--;inv[i].sold++;inv[i].updatedAt=Date.now();
-  sales.unshift({date:todayStr(),isbn:inv[i].isbn,title:inv[i].title,price:inv[i].price,ts:Date.now()});save();saveSales();render();showMsg('Sold one copy of "'+inv[i].title+'" for '+money(inv[i].price)+'.')}};
+  sales.unshift({date:todayStr(),isbn:inv[i].isbn,title:inv[i].title,price:inv[i].price,cost:inv[i].cost||0,ts:Date.now()});save();saveSales();render();showMsg('Sold one copy of "'+inv[i].title+'" for '+money(inv[i].price)+((inv[i].cost)?' (profit '+money(inv[i].price-inv[i].cost)+')':'')+'.')}};
 window.bump=(i,d)=>{inv[i].qty+=d;inv[i].updatedAt=Date.now();save();render()};
 window.removeBook=i=>{if(confirm('Remove "'+inv[i].title+'" from inventory?')){inv.splice(i,1);save();render()}};
 window.editBook=i=>{let p=prompt('New price:',inv[i].price);if(p!==null)inv[i].price=parseFloat(p)||0;
+  let co=prompt('What you paid for it (cost):',inv[i].cost||0);if(co!==null)inv[i].cost=parseFloat(co)||0;
   let s=prompt('Shelf / section:',inv[i].shelf);if(s!==null)inv[i].shelf=s;
   let c=prompt('Condition? Like new, Good, Fair, Worn, or Poor',inv[i].condition||'Good');if(c!==null)inv[i].condition=c;
+  let g=prompt('Genre:',inv[i].genre||'');if(g!==null)inv[i].genre=g;
   inv[i].updatedAt=Date.now();save();render()};
 
 /* --- Camera barcode scanning (ZXing) --- */
@@ -208,8 +224,8 @@ $('q').oninput=render;
 
 /* --- Backup --- */
 $('exportBtn').onclick=()=>{let a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify({version:1,exportedAt:new Date().toISOString(),books:inv,sales:sales},null,2)],{type:'application/json'}));a.download='bookstore-backup.json';a.click()};
-$('csvBtn').onclick=()=>{let rows=[['ISBN','Title','Author','Price','Qty','Sold','Shelf'].join(',')];
-  inv.forEach(b=>rows.push([b.isbn,'"'+String(b.title).replace(/"/g,'""')+'"','"'+String(b.author).replace(/"/g,'""')+'"',b.price,b.qty,b.sold,'"'+String(b.shelf).replace(/"/g,'""')+'"'].join(',')));
+$('csvBtn').onclick=()=>{let rows=[['ISBN','Title','Author','Genre','Price','Cost','Qty','Sold','Shelf','Condition'].join(',')];
+  inv.forEach(b=>rows.push([b.isbn,'"'+String(b.title).replace(/"/g,'""')+'"','"'+String(b.author).replace(/"/g,'""')+'"','"'+String(b.genre||'').replace(/"/g,'""')+'"',b.price,b.cost||0,b.qty,b.sold,'"'+String(b.shelf).replace(/"/g,'""')+'"','"'+String(b.condition||'').replace(/"/g,'""')+'"'].join(',')));
   let a=document.createElement('a');a.href=URL.createObjectURL(new Blob([rows.join('\n')],{type:'text/csv'}));a.download='bookstore-inventory.csv';a.click()};
 $('importBtn').onclick=()=>$('importFile').click();
 $('importFile').onchange=e=>{let f=e.target.files[0];if(!f)return;f.text().then(t=>{try{let j=JSON.parse(t);
