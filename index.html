@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Bookstore Inventory</title>
+<style>
+*{box-sizing:border-box} body{font-family:-apple-system,system-ui,sans-serif;margin:0 auto;max-width:640px;padding:12px 12px 40px;background:#fdf8ef;color:#222}
+h1{font-size:26px;margin:6px 0 2px}.sub{color:#666;margin:0 0 14px}
+button{font-size:20px;padding:14px 18px;border-radius:12px;border:0;cursor:pointer}
+.big{width:100%;margin:6px 0}.scan{background:#1a7f37;color:#fff;font-weight:700}
+.sell{background:#b42318;color:#fff}.ghost{background:#e8e2d5;color:#222}
+input,select{font-size:18px;padding:12px;border:1px solid #ccc;border-radius:10px;width:100%;margin:6px 0}
+.card{background:#fff;border:1px solid #ddd;border-radius:14px;padding:12px;margin:10px 0;display:flex;gap:12px}
+.card img{width:64px;height:96px;object-fit:cover;border-radius:6px;background:#eee}
+.card b{font-size:18px}.muted{color:#666;font-size:15px}
+.row{display:flex;gap:8px;flex-wrap:wrap}.row button{flex:1;padding:10px;font-size:17px}
+.stat{display:flex;gap:10px;text-align:center}.stat div{flex:1;background:#fff;border:1px solid #ddd;border-radius:12px;padding:10px}
+.stat b{font-size:22px;display:block}
+#scanner{display:none;margin:10px 0}#video{width:100%;border-radius:12px;background:#000}
+#msg{background:#fff3cd;border:1px solid #e6c87a;border-radius:10px;padding:10px;margin:10px 0;display:none}
+details{margin:12px 0} summary{font-size:18px;cursor:pointer}
+</style>
+<script src="https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js"></script>
+</head><body>
+<h1>📚 Bookstore Inventory</h1>
+<p class="sub">No accounts. No passwords. Everything stays on this phone. Works in English, French, Arabic and more — scanning reads the ISBN, not the language.</p>
+
+<div class="stat"><div><b id="statTitles">0</b>titles</div><div><b id="statCopies">0</b>copies</div><div><b id="statValue">$0</b>on shelves</div><div><b id="statToday">$0</b>sold today</div></div>
+
+<button class="big scan" id="scanBtn">📷 Scan a Book (barcode)</button>
+<div id="scanner"><video id="video" playsinline></video>
+<button class="big ghost" id="stopBtn">Done Scanning</button>
+<p class="muted">Point the camera at the barcode on the back of the book. It reads itself — you don't tap anything.</p></div>
+
+<div id="msg"></div>
+
+<details open><summary>➕ Add a book without scanning</summary>
+<input id="isbnIn" placeholder="Type the ISBN (numbers on the barcode)" inputmode="numeric">
+<button class="big ghost" id="isbnBtn">Look Up by ISBN</button>
+<input id="titleIn" placeholder="Or type the title to search">
+<button class="big ghost" id="titleBtn">Search by Title</button>
+<div id="searchResults"></div>
+</details>
+
+<input id="q" placeholder="🔍 Search your shelves: title, author, or ISBN">
+
+<div id="list"></div>
+
+<h2>💰 Today's Sales</h2>
+<div id="todaySales" class="muted">Nothing sold yet today.</div>
+<details><summary>📅 Sales history</summary><div id="salesHistory" class="muted"></div></details>
+
+<details><summary>💾 Backup &amp; restore</summary>
+<p class="muted">Back up once a week. If the phone is lost, the backup file is the inventory. The backup is also website-ready: every book and sale carries a stable ID and date, so a future website can read this same file without re-keying anything.</p>
+<button class="ghost" id="exportBtn">Download Backup</button>
+<button class="ghost" id="csvBtn">Download as Spreadsheet (CSV)</button>
+<button class="ghost" id="importBtn">Restore from Backup</button>
+<input type="file" id="importFile" accept=".json,application/json" style="display:none">
+</details>
+
+<script>
+/* Data model, kept website-ready on purpose: every book has a stable id and an
+   updatedAt timestamp, and every sale is its own dated event in a separate log.
+   A future website can merge these by id/timestamp instead of re-keying stock. */
+const KEY='bookstore_v1', SALES_KEY='bookstore_sales_v1';
+let inv=JSON.parse(localStorage.getItem(KEY)||'[]');
+let sales=JSON.parse(localStorage.getItem(SALES_KEY)||'[]');
+const $=id=>document.getElementById(id);
+const save=()=>localStorage.setItem(KEY,JSON.stringify(inv));
+const saveSales=()=>localStorage.setItem(SALES_KEY,JSON.stringify(sales));
+const todayStr=()=>{let d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')};
+const uid=()=> 'bk_'+Date.now().toString(36)+Math.random().toString(36).slice(2,6);
+const money=n=>'$'+Number(n||0).toFixed(2);
+function showMsg(t){let m=$('msg');m.style.display='block';m.textContent=t;setTimeout(()=>m.style.display='none',5000)}
+function esc(s){return String(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+
+/* --- Lookups (free, no key, in order) ---
+   1. Open Library  2. Google Books  3. Inventaire.io (aggregates national libraries, covers)
+   4. BnF (Bibliothèque nationale de France — strong French coverage; Open Library
+      misses some French editions BnF holds). The chain matters for French/Arabic stock:
+      a miss in one catalog is not a miss in the next. */
+function pickLabel(labels){if(!labels)return '';for(let l of ['fr','ar','en'])if(labels[l])return labels[l];let k=Object.keys(labels)[0];return k?labels[k]:''}
+async function lookupInventaire(isbn){
+  try{let r=await fetch('https://inventaire.io/api/entities?action=by-uris&uris=isbn:'+isbn);let j=await r.json();
+    let ent=j.entities&&j.entities['isbn:'+isbn];if(!ent)return null;
+    let title=pickLabel(ent.labels||{});
+    if(ent.claims&&ent.claims['wdt:P1476']&&ent.claims['wdt:P1476'][0])title=ent.claims['wdt:P1476'][0];
+    let author='';
+    if(ent.claims&&ent.claims['wdt:P50']&&ent.claims['wdt:P50'][0]){
+      try{let uris=ent.claims['wdt:P50'].slice(0,2).join('|');
+        let ar=await fetch('https://inventaire.io/api/entities?action=by-uris&uris='+encodeURIComponent(uris)).then(x=>x.json());
+        author=Object.values(ar.entities||{}).map(e=>pickLabel(e.labels||{})).filter(Boolean).join(', ')}catch(e){}}
+    let cover=ent.image?ent.image.url||ent.image:'';
+    if(title)return {isbn,title,author,cover}}catch(e){}
+  return null;
+}
+/* BnF SRU returns XML with several records per ISBN, including a thin commercial
+   stub — so we score each record block by length and read title/author from the
+   richest one, in either Dublin Core or UNIMARC form. */
+function parseBnF(xml){
+  let blocks=xml.match(/<recordData>[\s\S]*?<\/recordData>/g)||[xml];
+  blocks.sort((a,b)=>b.length-a.length);
+  for(let b of blocks){
+    let t=(b.match(/<dc:title[^>]*>([^<]+)<\/dc:title>/)||[])[1];
+    if(!t){let f200=b.match(/tag="200"[\s\S]*?code="a"[^>]*>([^<]+)</);t=f200?f200[1]:''}
+    if(!t)continue;
+    let a=(b.match(/<dc:creator[^>]*>([^<]+)<\/dc:creator>/)||[])[1];
+    if(!a){let f700=b.match(/tag="70[01]"[\s\S]*?code="a"[^>]*>([^<]+)</);a=f700?f700[1]:''}
+    return {title:t.replace(/^\s+|\s+$/g,''),author:(a||'').replace(/^\s+|\s+$/g,'')};
+  }
+  return null;
+}
+async function lookupBnF(isbn){
+  try{let url='https://catalogue.bnf.fr/api/SRU?version=1.2&operation=searchRetrieve&query=bib.isbn%20all%20%22'+isbn+'%22&maximumRecords=5';
+    let txt=await fetch(url).then(x=>x.text());let p=parseBnF(txt);
+    if(p)return {isbn,title:p.title,author:p.author,cover:''}}catch(e){}
+  return null;
+}
+async function lookupISBN(isbn){
+  isbn=String(isbn).replace(/[^0-9Xx]/g,'');
+  try{let r=await fetch('https://openlibrary.org/isbn/'+isbn+'.json');if(r.ok){let j=await r.json();
+    let author='';if(j.authors&&j.authors[0]){let a=await fetch('https://openlibrary.org'+j.authors[0].key+'.json').then(x=>x.json()).catch(()=>({}));author=a.name||''}
+    return {isbn,title:j.title||'',author,cover:j.covers?('https://covers.openlibrary.org/b/id/'+j.covers[0]+'-M.jpg'):('https://covers.openlibrary.org/b/isbn/'+isbn+'-M.jpg')}}}catch(e){}
+  try{let r=await fetch('https://www.googleapis.com/books/v1/volumes?q=isbn:'+isbn);let j=await r.json();
+    if(j.items&&j.items[0]){let v=j.items[0].volumeInfo;if(v.title)return {isbn,title:v.title||'',author:(v.authors||[]).join(', '),cover:(v.imageLinks&&v.imageLinks.thumbnail)||('https://covers.openlibrary.org/b/isbn/'+isbn+'-M.jpg')}}}catch(e){}
+  let inv=await lookupInventaire(isbn);if(inv)return inv;
+  let bnf=await lookupBnF(isbn);if(bnf)return bnf;
+  return {isbn,title:'',author:'',cover:''};
+}
+async function searchTitle(q){
+  let out=[];
+  try{let r=await fetch('https://openlibrary.org/search.json?title='+encodeURIComponent(q)+'&limit=8');let j=await r.json();
+    out=(j.docs||[]).map(d=>({isbn:(d.isbn||[])[0]||'',title:d.title||'',author:(d.author_name||[]).join(', '),cover:d.cover_i?('https://covers.openlibrary.org/b/id/'+d.cover_i+'-M.jpg'):''}))}catch(e){}
+  if(out.length<3){ /* top up thin results (common for Arabic/French titles) from Google Books */
+    try{let r=await fetch('https://www.googleapis.com/books/v1/volumes?q=intitle:'+encodeURIComponent(q)+'&maxResults=8');let j=await r.json();
+      (j.items||[]).forEach(it=>{let v=it.volumeInfo||{};let isbn='';(v.industryIdentifiers||[]).forEach(x=>{if(x.type==='ISBN_13')isbn=x.identifier});
+        if(v.title&&!out.some(o=>o.title.toLowerCase()===v.title.toLowerCase()))out.push({isbn,title:v.title,author:(v.authors||[]).join(', '),cover:(v.imageLinks&&v.imageLinks.thumbnail)||''})})}catch(e){}}
+  return out;
+}
+
+/* --- Add / edit --- */
+function addBook(b){
+  let ex=inv.find(x=>b.isbn&&x.isbn===b.isbn);
+  if(ex){ex.qty++;save();render();showMsg('Already on the shelf — added another copy of "'+ex.title+'". Now '+ex.qty+' in stock.');return}
+  let price=prompt('Price for "'+(b.title||'this book')+'"? (e.g. 8.50 — leave blank for $0)', '');
+  let shelf=prompt('Shelf or section? (e.g. Fiction A, History — leave blank if none)','');
+  let cond=prompt('Condition? Like new, Good, Fair, Worn, or Poor','Good');
+  inv.unshift({id:b.isbn?('isbn:'+b.isbn):uid(),isbn:b.isbn||'',title:b.title||'Unknown title',author:b.author||'',cover:b.cover||'',price:parseFloat(price)||0,shelf:shelf||'',condition:(cond||'Good').trim(),qty:1,sold:0,added:new Date().toISOString().slice(0,10),updatedAt:Date.now()});
+  save();render();showMsg('Added: '+(b.title||'book'));
+}
+function render(){
+  let q=$('q').value.toLowerCase();
+  let list=inv.filter(b=>(b.title+' '+b.author+' '+b.isbn).toLowerCase().includes(q));
+  $('statTitles').textContent=inv.length;
+  $('statCopies').textContent=inv.reduce((a,b)=>a+b.qty,0);
+  $('statValue').textContent=money(inv.reduce((a,b)=>a+b.qty*b.price,0));
+  let today=sales.filter(s=>s.date===todayStr());
+  $('statToday').textContent=money(today.reduce((a,s)=>a+s.price,0))+' ('+today.length+')';
+  $('todaySales').innerHTML=today.length
+    ? today.map(s=>esc(s.title)+' — '+money(s.price)).join('<br>')+'<br><b>Total: '+money(today.reduce((a,s)=>a+s.price,0))+'</b>'
+    : 'Nothing sold yet today.';
+  let byDate={};sales.forEach(s=>{byDate[s.date]=byDate[s.date]||[];byDate[s.date].push(s)});
+  $('salesHistory').innerHTML=Object.keys(byDate).sort().reverse().map(d=>{
+    let day=byDate[d];return d+' — '+day.length+' sold, '+money(day.reduce((a,s)=>a+s.price,0))}).join('<br>')||'No sales recorded yet.';
+  $('list').innerHTML=list.length?list.map((b,i)=>{let idx=inv.indexOf(b);return `<div class="card">
+    ${b.cover?`<img src="${esc(b.cover)}" alt="">`:''}
+    <div style="flex:1"><b dir="auto">${esc(b.title)}</b><div class="muted" dir="auto">${esc(b.author)}${b.isbn?' · ISBN '+esc(b.isbn):''}${b.shelf?' · 📍 '+esc(b.shelf):''}${b.condition?' · ✨ '+esc(b.condition):''}</div>
+    <div style="margin:6px 0">${money(b.price)} each · <b>${b.qty} in stock</b>${b.sold?' · '+b.sold+' sold':''}</div>
+    <div class="row">
+      <button class="sell" onclick="sell(${idx})">💰 Sold One</button>
+      <button class="ghost" onclick="bump(${idx},1)">＋ Add Copy</button>
+      <button class="ghost" onclick="editBook(${idx})">✏️ Price / Shelf</button>
+      <button class="ghost" onclick="removeBook(${idx})">🗑️ Remove</button>
+    </div></div></div>`}).join(''):'<p class="muted">No books on the shelves yet. Tap "Scan a Book" to add your first one.</p>';
+}
+window.sell=i=>{if(inv[i].qty>0){inv[i].qty--;inv[i].sold++;inv[i].updatedAt=Date.now();
+  sales.unshift({date:todayStr(),isbn:inv[i].isbn,title:inv[i].title,price:inv[i].price,ts:Date.now()});save();saveSales();render();showMsg('Sold one copy of "'+inv[i].title+'" for '+money(inv[i].price)+'.')}};
+window.bump=(i,d)=>{inv[i].qty+=d;inv[i].updatedAt=Date.now();save();render()};
+window.removeBook=i=>{if(confirm('Remove "'+inv[i].title+'" from inventory?')){inv.splice(i,1);save();render()}};
+window.editBook=i=>{let p=prompt('New price:',inv[i].price);if(p!==null)inv[i].price=parseFloat(p)||0;
+  let s=prompt('Shelf / section:',inv[i].shelf);if(s!==null)inv[i].shelf=s;
+  let c=prompt('Condition? Like new, Good, Fair, Worn, or Poor',inv[i].condition||'Good');if(c!==null)inv[i].condition=c;
+  inv[i].updatedAt=Date.now();save();render()};
+
+/* --- Camera barcode scanning (ZXing) --- */
+let reader=null,scanning=false;
+$('scanBtn').onclick=async()=>{
+  if(typeof ZXing==='undefined'){alert('The barcode reader did not load — check your internet connection and try again. You can still add books by typing the ISBN below.');return}
+  $('scanner').style.display='block';scanning=true;reader=new ZXing.BrowserMultiFormatReader();
+  try{await reader.decodeFromVideoDevice(null,'video',async(res,err)=>{
+    if(res&&scanning){let code=res.getText();scanning=false;await reader.reset();$('scanner').style.display='none';
+      showMsg('Barcode read: '+code+' — looking it up…');
+      let b=await lookupISBN(code);if(!b.title){b.title=prompt('Could not look this book up automatically. Type its title:','')||'Unknown title'}
+      addBook(b)}
+  })}catch(e){alert('Camera could not start. On an iPhone, open this page in Safari over https and allow camera access. You can still add books by typing the ISBN.')}
+};
+$('stopBtn').onclick=async()=>{scanning=false;if(reader)await reader.reset();$('scanner').style.display='none'};
+
+/* --- Manual paths --- */
+$('isbnBtn').onclick=async()=>{let isbn=$('isbnIn').value.trim();if(!isbn)return;showMsg('Looking up ISBN '+isbn+'…');
+  let b=await lookupISBN(isbn);if(!b.title){b.title=prompt('Could not look this book up automatically. Type its title:','')||'Unknown title'}addBook(b)};
+$('titleBtn').onclick=async()=>{let q=$('titleIn').value.trim();if(!q)return;showMsg('Searching…');
+  let res=await searchTitle(q);
+  $('searchResults').innerHTML=res.length?res.map((b,i)=>`<div class="card"><div style="flex:1"><b dir="auto">${esc(b.title)}</b><div class="muted" dir="auto">${esc(b.author)}</div>
+    <button class="ghost" onclick="pickResult(${i})">Add this book</button></div></div>`).join(''):'<p class="muted">No matches — check the spelling, or add it by ISBN.</p>';
+  window._results=res};
+window.pickResult=i=>{addBook(window._results[i]);$('searchResults').innerHTML=''};
+$('q').oninput=render;
+
+/* --- Backup --- */
+$('exportBtn').onclick=()=>{let a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify({version:1,exportedAt:new Date().toISOString(),books:inv,sales:sales},null,2)],{type:'application/json'}));a.download='bookstore-backup.json';a.click()};
+$('csvBtn').onclick=()=>{let rows=[['ISBN','Title','Author','Price','Qty','Sold','Shelf'].join(',')];
+  inv.forEach(b=>rows.push([b.isbn,'"'+String(b.title).replace(/"/g,'""')+'"','"'+String(b.author).replace(/"/g,'""')+'"',b.price,b.qty,b.sold,'"'+String(b.shelf).replace(/"/g,'""')+'"'].join(',')));
+  let a=document.createElement('a');a.href=URL.createObjectURL(new Blob([rows.join('\n')],{type:'text/csv'}));a.download='bookstore-inventory.csv';a.click()};
+$('importBtn').onclick=()=>$('importFile').click();
+$('importFile').onchange=e=>{let f=e.target.files[0];if(!f)return;f.text().then(t=>{try{let j=JSON.parse(t);
+  if(Array.isArray(j)){inv=j}else if(j.books){inv=j.books;sales=j.sales||[];saveSales()}else throw 0;
+  save();render();showMsg('Restored '+inv.length+' titles from backup.')}catch(err){alert('That file does not look like a bookstore backup.')}})};
+render();
+</script></body></html>
